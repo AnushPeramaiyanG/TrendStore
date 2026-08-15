@@ -137,6 +137,12 @@ ap-south-1
 trend-cluster
 ```
 
+### Kubernetes Namespace
+
+```text
+trend
+```
+
 ### Kubernetes Application
 
 ```text
