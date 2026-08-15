@@ -90,7 +90,8 @@ pipeline {
                     kubectl apply \
                       -f k8s/namespace.yaml \
                       -f k8s/deployment.yaml \
-                      -f k8s/service.yaml
+                      -f k8s/service.yaml \
+                      -f k8s/ingress.yaml
 
                     echo "Updating deployment image..."
 
