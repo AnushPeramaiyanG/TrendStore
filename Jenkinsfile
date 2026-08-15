@@ -88,6 +88,7 @@ pipeline {
                     echo "Applying Kubernetes manifests..."
 
                     kubectl apply \
+                      -f k8s/namespace.yaml \
                       -f k8s/deployment.yaml \
                       -f k8s/service.yaml
 
