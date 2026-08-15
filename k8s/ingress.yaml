@@ -19,6 +19,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: trendstore-service
+                name: trend-service
                 port:
                   number: 80
