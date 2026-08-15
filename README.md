@@ -639,7 +639,7 @@ spec:
       containers:
         - name: trend-app
 
-          image: <AWS-ACCOUNT-ID>.dkr.ecr.ap-south-1.amazonaws.com/trend-app:latest
+          image: <DOCKER-USERNAME>/trend-app:latest
 
           ports:
             - containerPort: 80
@@ -984,9 +984,10 @@ pipeline {
 
     environment {
         AWS_REGION = 'ap-south-1'
-        ECR_REPOSITORY = 'trend-app'
-        EKS_CLUSTER = 'trend-cluster'
-        IMAGE_TAG = 'latest'
+        DOCKER_IMAGE = '<DOCKER-USERNAME>/trend-app'
+        IMAGE_TAG    = "${BUILD_NUMBER}"
+        EKS_CLUSTER  = 'trend-cluster'
+        K8S_NAMESPACE = 'trend'
     }
 
     stages {
@@ -997,67 +998,92 @@ pipeline {
             }
         }
 
+        stage('Verify Pre-Built dist') {
+            steps {
+                sh '''
+                    echo "Checking pre-built React dist folder..."
+
+                    if [ ! -d "dist" ]; then
+                        echo "ERROR: dist folder not found!"
+                        exit 1
+                    fi
+
+                    echo "dist folder found."
+                    ls -lah dist/
+                '''
+            }
+        }
+
         stage('Docker Build') {
             steps {
                 sh '''
+                    echo "Building Docker image..."
+
                     docker build \
-                      -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
+                      -t ${DOCKER_IMAGE}:${IMAGE_TAG} \
+                      -t ${DOCKER_IMAGE}:latest \
+                      .
                 '''
             }
         }
 
-        stage('ECR Login') {
+        stage('DockerHub Login') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-docker',
+                        usernameVariable: 'DOCKER_USERNAME',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        echo "$DOCKER_PASSWORD" | docker login \
+                          -u "$DOCKER_USERNAME" \
+                          --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
             steps {
                 sh '''
-                    AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-                      --query Account \
-                      --output text)
+                    echo "Pushing Docker image..."
 
-                    aws ecr get-login-password \
-                      --region ${AWS_REGION} | \
-                    docker login \
-                      --username AWS \
-                      --password-stdin \
-                      ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                    docker push ${DOCKER_IMAGE}:${IMAGE_TAG}
+                    docker push ${DOCKER_IMAGE}:latest
                 '''
             }
         }
 
-        stage('Docker Tag and Push') {
+        stage('Deploy to EKS') {
             steps {
                 sh '''
-                    AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-                      --query Account \
-                      --output text)
+                    echo "Updating EKS kubeconfig..."
 
-                    ECR_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}
-
-                    docker tag \
-                      ${ECR_REPOSITORY}:${IMAGE_TAG} \
-                      ${ECR_URI}:${IMAGE_TAG}
-
-                    docker push \
-                      ${ECR_URI}:${IMAGE_TAG}
-                '''
-            }
-        }
-
-        stage('Configure EKS') {
-            steps {
-                sh '''
                     aws eks update-kubeconfig \
                       --region ${AWS_REGION} \
                       --name ${EKS_CLUSTER}
-                '''
-            }
-        }
 
-        stage('Deploy to Kubernetes') {
-            steps {
-                sh '''
-                    kubectl apply -f deployment.yaml
-                    kubectl apply -f service.yaml
-                    kubectl apply -f ingress.yaml
+                    echo "Applying Kubernetes manifests..."
+
+                    kubectl apply \
+                      -f k8s/namespace.yaml \
+                      -f k8s/deployment.yaml \
+                      -f k8s/service.yaml \
+                      -f k8s/ingress.yaml
+
+                    echo "Updating deployment image..."
+
+                    kubectl -n ${K8S_NAMESPACE} set image \
+                      deployment/trend-app \
+                      trend-app=${DOCKER_IMAGE}:${IMAGE_TAG}
+
+                    echo "Waiting for rollout..."
+
+                    kubectl -n ${K8S_NAMESPACE} rollout status \
+                      deployment/trend-app \
+                      --timeout=180s
                 '''
             }
         }
@@ -1065,18 +1091,44 @@ pipeline {
         stage('Verify Deployment') {
             steps {
                 sh '''
-                    kubectl rollout status deployment/trend-app
-                    kubectl get pods
-                    kubectl get svc
-                    kubectl get ingress
+                    echo "Checking Kubernetes deployment..."
+
+                    kubectl -n ${K8S_NAMESPACE} get deployment trend-app
+
+                    echo "Checking pods..."
+
+                    kubectl -n ${K8S_NAMESPACE} get pods
+
+                    echo "Checking service..."
+
+                    kubectl -n ${K8S_NAMESPACE} get svc
                 '''
             }
+        }
+    }
+
+    post {
+
+        success {
+            echo '============================================='
+            echo 'Trend CI/CD Pipeline Completed Successfully'
+            echo '============================================='
+        }
+
+        failure {
+            echo '============================================='
+            echo 'Trend CI/CD Pipeline Failed'
+            echo '============================================='
+        }
+
+        always {
+            sh 'docker logout || true'
         }
     }
 }
 ```
 
-> Adjust the Jenkinsfile according to the Jenkins credentials, IAM role, Docker registry, ECR repository, and Kubernetes configuration used in the actual environment.
+> Adjust the Jenkinsfile according to the Jenkins credentials, IAM role, Docker registry, DockerHub repository, and Kubernetes configuration used in the actual environment.
 
 ---
 
@@ -1098,7 +1150,7 @@ Jenkins
    │
    ├── Docker Build
    │
-   ├── ECR Login
+   ├── DockerHub Login
    │
    ├── Docker Tag
    │
@@ -1135,24 +1187,22 @@ The project uses AWS IAM roles and policies to provide controlled access to AWS 
 
 Required AWS services include:
 
-* Amazon ECR
 * Amazon EKS
 * IAM
 * Amazon EC2
 * Amazon VPC
 * Elastic Load Balancing
-* Amazon CloudWatch
 
 The Jenkins execution identity requires permissions to:
 
-* Authenticate to Amazon ECR
+* Authenticate to Docker Hub Login
 * Push Docker images
 * Access the EKS cluster
 * Update Kubernetes resources
 * Retrieve AWS account information
 * Update EKS kubeconfig
 
-The EKS worker-node role requires permissions to pull private images from ECR.
+The EKS worker-node role requires permissions to pull private images from Docker Hub.
 
 The AWS Load Balancer Controller uses an IAM role associated with its Kubernetes service account.
 
@@ -1232,7 +1282,7 @@ Pipeline
 Docker Build
    │
    ▼
-ECR
+DockerHub
    │
    ▼
 EKS
@@ -1242,21 +1292,55 @@ This provides automated continuous integration and continuous deployment.
 
 ---
 
-# 20. 📊 CloudWatch Monitoring
+# 20. 📊 Prometheus & Grafana Monitoring
 
-AWS CloudWatch can be used to monitor the TrendStore infrastructure and CI/CD environment.
+Prometheus and Grafana are used to monitor the **TrendStore application and Kubernetes environment**
 
-Monitoring includes:
+**Prometheus** collects and stores metrics from the Kubernetes cluster, nodes, Pods, and application components.
 
-* Jenkins/EC2 infrastructure logs where configured
-* EKS-related logs
-* Application logs
-* AWS Load Balancer metrics
-* Infrastructure health
-* Deployment status
-* AWS service events
+**Grafana** provides dashboards and visualizations for analyzing the metrics collected by Prometheus.
 
-CloudWatch Logs can be used to investigate deployment failures and application issues.
+---
+
+## Monitoring Architecture
+
+```text
+                    TrendStore Application
+                             │
+                             ▼
+                       Kubernetes
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+              ▼              ▼              ▼
+           Pods           Nodes       Kubernetes Metrics
+              │              │              │
+              └──────────────┼──────────────┘
+                             │
+                             ▼
+                       Prometheus
+                       Metrics Server
+                             │
+                             ▼
+                          Grafana
+                             │
+                             ▼
+                     Monitoring Dashboard
+```
+
+---
+
+## Monitoring Components
+
+| **Component**      | **Purpose**                            |
+| ------------------ | -------------------------------------- |
+| Prometheus         | Metrics collection and monitoring      |
+| Grafana            | Metrics visualization and dashboards   |
+| Kubernetes         | Container orchestration                |
+| Node Exporter      | Linux node-level metrics               |
+| Kube State Metrics | Kubernetes object and resource metrics |
+| TrendStore Pods    | Application workload                   |
+| Amazon EKS         | Kubernetes platform                    |
 
 ---
 
@@ -1333,16 +1417,6 @@ Check running containers:
 docker ps
 ```
 
-Check detailed image information:
-
-```bash
-aws ecr describe-images \
-  --repository-name trend-app \
-  --region ap-south-1
-```
-
----
-
 # 23. 🧹 Cleanup
 
 Delete Kubernetes resources:
@@ -1374,7 +1448,7 @@ EC2 / Jenkins                        ✅ Running
 GitHub Repository                    ✅ Available
 Jenkins Pipeline                     ✅ Successful
 Docker Image                         ✅ Built
-ECR Image                            ✅ Available
+Docker Hub Image                     ✅ Available
 EKS Cluster                          ✅ Available
 EKS Nodes                            ✅ Ready
 Kubernetes Deployment                ✅ Available
@@ -1447,7 +1521,7 @@ The final solution provides a repeatable and automated deployment process for th
 
 # 27. 📸 Project Documentation
 
-The complete project steps, AWS configuration screenshots, Jenkins pipeline screenshots, Docker image screenshots, EKS screenshots, Kubernetes resource screenshots, ALB screenshots, and CloudWatch monitoring screenshots are documented and attached to this repository.
+The complete project steps, AWS configuration screenshots, Jenkins pipeline screenshots, Docker image screenshots, EKS screenshots, Kubernetes resource screenshots, ALB screenshots, and Prometheus and Grafana monitoring screenshots are documented and attached to this repository.
 
 # 28. 📸 Project Submission
 Application Load Balancer ARN: arn:aws:elasticloadbalancing:ap-south-1:526644151944:loadbalancer/app/k8s-trendstore-8a0598593b/cfd2a8c35e073bc6
