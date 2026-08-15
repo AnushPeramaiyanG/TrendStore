@@ -1160,6 +1160,7 @@ Jenkins
    │
    └── kubectl apply
           │
+          ├── namespace.yaml
           ├── deployment.yaml
           ├── service.yaml
           └── ingress.yaml
